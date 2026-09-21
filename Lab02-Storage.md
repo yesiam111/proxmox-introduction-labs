@@ -229,4 +229,4 @@ Kỳ vọng: `Quorate: Yes` · `nfs-store active` · `HEALTH_OK` · `mon: 3 ... 
 
 **Báo instructor khi cả cụm HEALTH_OK** → instructor snapshot **checkpoint 2** → nhận challenge.
 
-> Sau checkpoint 2, instructor mới chạy `setup02.sh` (dựng iSCSI target + tình huống challenge). Challenge chuyển sang backend **khác** (iSCSI + multipath) — không phải Ceph — để bạn chạm cả hai mô hình: "Proxmox quản lý redundancy" (Ceph, guided) và "array quản lý redundancy" (SAN, challenge).
+> Sau checkpoint 2, instructor mới chạy `setup02.sh` (dựng iSCSI target + tình huống challenge). Challenge chuyển sang backend **khác** (iSCSI + multipath) — không phải Ceph — để bạn tiếp xúc cả hai mô hình: "Proxmox quản lý redundancy" (Ceph, guided) và "array quản lý redundancy" (SAN, challenge).
