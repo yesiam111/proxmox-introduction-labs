@@ -72,13 +72,15 @@ qm guest exec <vmid> -- <lenh>                    # chạy lệnh trong guest qu
 > `qm guest exec` trả về JSON chứa `"exitcode"` của lệnh trong guest, còn bản thân `qm` hầu như
 > luôn exit 0 — muốn biết lệnh trong guest thành công hay không thì phải đọc `"exitcode"`.
 
-**Bên trong guest** (nếu agent chưa phản hồi)
+**Bên trong guest** — gói `qemu-guest-agent` đã có sẵn trong appliance, **không cần cài**:
 
 ```bash
-apt-get install -y qemu-guest-agent
-systemctl is-active qemu-guest-agent     # 'static'/không enable được là ĐÚNG: unit kích hoạt theo
-systemctl start qemu-guest-agent         # thiết bị (udev bắt cổng virtio khi VM có --agent 1)
+systemctl is-active qemu-guest-agent     # 'inactive' -> chưa có cổng virtio, quay ra bật --agent 1
+systemctl start qemu-guest-agent         # chỉ cần khi cổng đã có mà dịch vụ chưa chạy
 ```
+
+> `systemctl is-enabled` trả `static` là ĐÚNG: unit này không có `[Install]`, nó được udev kích hoạt
+> khi thấy `/dev/virtio-ports/org.qemu.guest_agent.0` — cổng chỉ tồn tại khi VM được set `--agent 1`.
 
 ## Cách tự kiểm
 
