@@ -33,7 +33,7 @@ cp /mnt/pve/nfs-store/images/debian-13-generic-amd64.qcow2 /root/
 # Cách 2 (nếu lớp cho phép internet): tải bản 'latest' từ upstream
 cd /root && wget -O debian-13-generic-amd64.qcow2 \
   https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2
-# LƯU Ý: cloud image của Debian KHÔNG kèm qemu-guest-agent — ta sẽ tự cài trong guest ở Bước 3.
+# LƯU Ý: cloud image của Debian KHÔNG kèm qemu-guest-agent — ta sẽ tự cài trong guest ở Bước 1 (dưới).
 ```
 
 Tạo khung VM 9000 và import đĩa cloud image vào `vmpool` (Ceph):
@@ -102,9 +102,16 @@ qm config 9000 | grep -E 'template|scsi0|agent'      # template: 1
 
 Kỳ vọng: `qm config 9000` có dòng `template: 1`, disk trên `vmpool`, `agent: 1`, **không còn** `ipconfig0`.
 
+> **Không `systemctl enable qemu-guest-agent`** — unit này không có `[Install]`, nó do udev bật khi
+> thấy cổng `/dev/virtio-ports/org.qemu.guest_agent.0`. Đọc `systemctl is-enabled`:
 >
-> Hệ quả cần nhớ: nếu quên `qm set --agent 1` thì trong guest **không có cổng** → udev không kích hoạt
-> → dịch vụ không chạy, dù gói đã cài. Lại đúng mẫu "agent hai phía" một lần nữa.
+> | Kết quả | Nghĩa là | Làm gì |
+> |---|---|---|
+> | `static` | Đã cài, chờ udev kích hoạt — **đúng** | kiểm tiếp `is-active` |
+> | `not-found` | Unit không tồn tại → **chưa cài gói** | `apt-get install -y qemu-guest-agent` |
+>
+> Nếu quên `qm set --agent 1` thì trong guest **không có cổng** → udev không kích hoạt → dịch vụ không
+> chạy dù gói đã cài.
 
 > **Vì sao cài ở template chứ không cài trên từng VM:** template 9000 là *Golden image* của lớp — VM 130,
 > 132 và mọi clone sau này đều thừa hưởng. Cài một lần ở đây thay vì lặp lại trên từng máy chính là
@@ -179,7 +186,7 @@ qm snapshot 130 pre-change --description "trước khi đổi cấu hình"
 qm listsnapshot 130
 ```
 
-Kỳ vọng: snapshot `pre-change` xuất hiện (Ceph RBD hỗ trợ snapshot — nối Bài 02).
+Kỳ vọng: snapshot `pre-change` xuất hiện (Ceph RBD hỗ trợ snapshot).
 
 > Thử trên storage KHÔNG hỗ trợ (vd iscsi-lvm từ challenge 02) sẽ bị từ chối — chứng minh "snapshot là thuộc tính của storage". Nhắc: snapshot ≠ backup (Bài 05).
 
@@ -296,5 +303,3 @@ Kỳ vọng: tất cả `OK` — template, clones, agent, **vệ sinh ảnh vàn
 > một số agent giám sát) sẽ nhầm máy này với máy kia. Sửa: quay lại Bước 1, `truncate -s 0
 > /etc/machine-id` trong template rồi dựng lại clone — **không** sửa tay trên từng clone, vì template
 > hỏng thì mọi clone sau vẫn hỏng.
-
-**Báo instructor khi mọi dòng OK**
