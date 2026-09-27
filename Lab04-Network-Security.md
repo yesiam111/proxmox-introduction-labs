@@ -85,7 +85,7 @@ Kỳ vọng: cả hai `OK`, `ceph -s` HEALTH_OK. Đây là baseline mà challeng
 # Giữ nguyên phần cũ, chỉ thay tag:
 qm set 130 --net0 "$(qm config 130 | sed -n 's/^net0: //p' | sed 's/,tag=[0-9]*//'),tag=100"
 qm config 130 | grep net0                    # thấy bridge=vmbr0,tag=100
-bridge vlan show | grep -A1 tap130            # tap của VM 130 gắn VLAN 100
+bridge vlan show dev tap130i0                 # hỏi ĐÚNG port
 ```
 
 **Đổi IP tĩnh sang dải VLAN 100** (lab không dùng DHCP — đổi subnet thì phải đổi IP):
@@ -103,9 +103,13 @@ Kỳ vọng: cả hai lệnh trong guest chạy sạch. Từ jump cũng ping đ�
 phân đoạn mạng mà **vẫn phục vụ được**, đó mới là bằng chứng VLAN cấu hình đúng (chỉ nhìn
 `bridge vlan show` là chưa đủ).
 
-> Gateway `10.0.100.1` nằm trên `jump` (`ens19.100`) và được NAT ra Internet
-> Nếu ping gateway fail mà `bridge vlan show` vẫn đúng:
-> kiểm trunk VLAN ở lớp ngoài, không phải cấu hình trong node.
+> Gateway `10.0.100.1` nằm trên `jump` (`ens19.100`). Jump **định tuyến** giữa VLAN 100 và mạng mgmt,
+> rồi NAT ra Internet qua `ens18`.
+
+**Vì sao VM ở VLAN 100 vẫn ping được IP của node (`10.0.10.11`) dù khác VLAN?** VLAN chỉ cô lập ở
+**tầng 2**. Khác subnet thì guest gửi gói cho gateway `10.0.100.1` (jump); jump có chân ở cả
+`10.0.100.0/24` lẫn `10.0.10.0/24`, bật `ip_forward` → nó **định tuyến** giữa hai VLAN (mô hình
+*router-on-a-stick*). Khác VLAN ≠ cách ly: muốn cách ly tầng 3 thì phải có rule firewall trên router.
 
 Kiểm thử failover (không làm rớt VM/mgmt): hạ slave đang active của bond0, xác nhận chuyển sang slave kia:
 
@@ -119,257 +123,9 @@ ip link set ens18 up                                      # khôi phục
 
 Kỳ vọng: `Currently Active Slave` đổi sang NIC còn lại, MII vẫn `up` — dự phòng hoạt động.
 
-## Bước 4 — Open vSwitch (vSwitch thay cho Linux bridge)
-
-> **OVS là LỰA CHỌN THAY THẾ, không phải bổ sung.** Tài liệu Proxmox nói rõ: **không được trộn**
-> OVS với bridge/bond/VLAN của Linux. Một node đã dùng `bond0` + `vmbr0` Linux (Bước 1) thì
-> muốn chuyển sang OVS phải chuyển **cả cụm interface đó**.
->
-> Vì vậy lab này làm **OVS trên một bridge riêng, không có NIC vật lý** — học đúng cú pháp và
-> công cụ mà **không đụng đường quản trị**. Cấu hình chuyển đổi thật cho production ở cuối bước.
-
-### 4.1 Cài đặt và xem cấu trúc
-
-```bash
-apt-get install -y openvswitch-switch
-ovs-vsctl show                      # rỗng lúc đầu — đây là "switch" của bạn
-ovs-vsctl --version
-```
-
-### 4.2 Tạo OVS bridge + OVS internal port
-
-Thêm vào `/etc/network/interfaces` (đổi `.11` theo node):
-
-```
-# OVS bridge dùng để học — KHÔNG gắn NIC vật lý, không ảnh hưởng mgmt
-auto vmbr9
-iface vmbr9 inet manual
-    ovs_type OVSBridge
-    ovs_ports ovsint200
-
-# Host interface trong VLAN 200 (tương đương "RVI/IRB" trên switch vật lý)
-auto ovsint200
-iface ovsint200 inet static
-    ovs_type OVSIntPort
-    ovs_bridge vmbr9
-    ovs_options tag=200
-    address 10.0.200.11/24
-```
-
-```bash
-ifreload -a
-ovs-vsctl show                      # thấy Bridge vmbr9, Port ovsint200 tag: 200
-ip -br a show ovsint200             # có IP 10.0.200.11/24
-```
-
-> ⚠️ **Bẫy  #1 của OVS:** mọi interface thành viên **phải được liệt kê trong `ovs_ports`** của
-> bridge, *dù* bản thân nó đã khai `ovs_bridge`. Thiếu dòng đó thì interface không được bật —
-> không báo lỗi rõ ràng. Đây là lỗi hay gặp nhất khi mới dùng OVS.
-
-### 4.3 Gắn VM vào OVS bridge
-
-```bash
-qm set 130 --net1 virtio,bridge=vmbr9,tag=200      # NIC phụ, không đụng net0 đang chạy
-qm config 130 | grep net1
-ovs-vsctl show                                      # xuất hiện Port tap130i1 tag: 200
-```
-
-> **Khác biệt mô hình:** Linux bridge kiểu cũ cần **một bridge cho mỗi VLAN**. OVS dùng **một
-> bridge duy nhất mang mọi VLAN**, tag đặt trên từng cổng VM. Thêm/bớt VLAN không phải tạo bridge mới.
-
-### 4.4 So sánh và tiêu chí chọn
-
-| | Linux bridge (mặc định PVE) | Open vSwitch |
-|---|---|---|
-| Cài đặt | có sẵn | `openvswitch-switch` |
-| VLAN | `bridge-vlan-aware yes` + `tag=` | một bridge mang mọi VLAN, `tag=` trên cổng |
-| Bond | `bond-mode` (kernel bonding) | `OVSBond` + `ovs_options bond_mode=` |
-| IP cho host trên VLAN | sub-interface `vmbr0.50` | **OVSIntPort** |
-| MTU | `mtu 9000` | **`ovs_mtu 9000`** trên NIC + bond + bridge |
-| Tính năng thêm | — | RSTP, VXLAN, OpenFlow, `bond_mode=balance-slb` (không cần switch hỗ trợ LACP) |
-| Công cụ | `bridge`, `ip` | `ovs-vsctl`, `ovs-appctl` |
-
-**Khi nào chọn OVS:** cần RSTP, OpenFlow, hoặc bond chia tải mà switch **không** hỗ trợ LACP
-(`balance-slb`). Ngoài các nhu cầu đó, Linux bridge đơn giản hơn và là mặc định của Proxmox.
-
-### 4.5 (Tham chiếu) Cấu hình production tương đương Bước 1 bằng OVS
-
-Không chạy trong lab — đây là bản dịch của thiết kế bond + VLAN sang OVS để mang về dùng:
-
-```
-auto ens18
-iface ens18 inet manual
-    ovs_mtu 1500
-
-auto ens19
-iface ens19 inet manual
-    ovs_mtu 1500
-
-auto bond0
-iface bond0 inet manual
-    ovs_bridge vmbr0
-    ovs_type OVSBond
-    ovs_bonds ens18 ens19
-    ovs_options bond_mode=balance-slb vlan_mode=native-untagged
-    # LACP (cần switch cấu hình tương ứng):
-    # ovs_options bond_mode=balance-tcp lacp=active other_config:lacp-time=fast
-
-auto vmbr0
-iface vmbr0 inet manual
-    ovs_type OVSBridge
-    ovs_ports bond0 mgmt
-
-auto mgmt
-iface mgmt inet static
-    ovs_type OVSIntPort
-    ovs_bridge vmbr0
-    ovs_options vlan_mode=access
-    address 10.0.10.11/24
-    gateway 10.0.10.1
-```
-
-> ⚠️ **Bẫy số 2:** với MTU > 1500, OVS dùng **`ovs_mtu`** (không phải `mtu`) và phải đặt trên
-> **cả** NIC vật lý, bond **và** bridge — thiếu một chỗ là interface không lên.
->
-> ⚠️ **Chuyển đổi thật luôn cần console.** Đổi `vmbr0` sang OVS là cắt đường mgmt trong lúc
-> `ifreload` chạy. Làm qua noVNC của lớp ngoài, không qua SSH.
-
 ---
 
-## Bước 5 — SDN: mạng ảo, IPAM, DHCP và DNS trong Proxmox
-
-> Tới đây mọi IP đều **tĩnh** — đó là chủ ý để lab ổn định và chấm được. Bước này giới thiệu
-> **SDN**, nơi Proxmox tự làm gateway, **IPAM**, **DHCP** và **DNS** cho một mạng ảo, tách hẳn
-> khỏi hạ tầng đang chạy. Đây là cách Proxmox trả lời câu hỏi "quản lý DHCP/DNS ở đâu?".
-
-### 5.1 Cài dnsmasq (bắt buộc cho DHCP của SDN)
-
-Trên **mỗi node**:
-
-```bash
-apt-get install -y dnsmasq
-systemctl disable --now dnsmasq     # SDN tự quản lý tiến trình riêng, KHÔNG dùng service mặc định
-```
-
-### 5.2 Zone → VNet → Subnet (Datacenter → SDN)
-
-| Lớp | Là gì | Giá trị dùng trong lab |
-|---|---|---|
-| **Zone** | Kiểu mạng ảo + phạm vi | `labzone`, type **Simple**, ✅ automatic DHCP, IPAM = `pve` |
-| **VNet** | "Switch ảo" học viên gắn VM vào | `vnet0`, thuộc `labzone` |
-| **Subnet** | Dải IP + gateway + SNAT | `10.0.250.0/24`, gateway `10.0.250.1`, ✅ SNAT |
-| **DHCP Range** | Dải cấp động | `10.0.250.50` → `10.0.250.200` |
-
-Làm trên GUI: **Datacenter → SDN → Zones → Add → Simple** (mục Advanced có *automatic DHCP*),
-rồi **VNets → Add**, rồi chọn vnet0 → **Subnets → Create** (tab *DHCP Ranges* để nhập dải).
-
-Cuối cùng bấm **SDN → Apply** và chờ task `reload network` xong sạch.
-
-```bash
-cat /etc/pve/sdn/zones.cfg /etc/pve/sdn/vnets.cfg /etc/pve/sdn/subnets.cfg
-ip -br a show vnet0                 # vnet0 có IP gateway 10.0.250.1
-```
-
-### 5.3 Mở firewall cho DHCP và DNS (phối hợp với Bước 7)
-
-Vì cụm đã bật firewall, **phải** cho phép DHCP + DNS trên `vnet0`, nếu không guest không xin được
-lease. Datacenter → Firewall → Add, hai rule:
-
-| Direction | Action | Interface | Macro | Dest |
-|---|---|---|---|---|
-| in | ACCEPT | `vnet0` | `DHCPfwd` | — |
-| in | ACCEPT | `vnet0` | `DNS` | `10.0.250.1` |
-
-> Đặt **Dest = gateway** cho rule DNS. Bỏ trống là mở mọi traffic DNS, có thể bị lợi dụng để
-> lách các rule khác.
-
-### 5.4 Gắn guest vào VNet và xem DHCP hoạt động
-
-```bash
-# CT mới, lấy IP bằng DHCP từ SDN
-CTTPL=$(pvesm list nfs-store --content vztmpl | awk '/debian-12-standard/{print $1; exit}')
-pct create 250 "$CTTPL" --hostname sdn-demo --cores 1 --memory 512 \
-  --rootfs vmpool:4 --unprivileged 1 \
-  --net0 name=eth0,bridge=vnet0,ip=dhcp
-pct start 250
-sleep 10
-pct exec 250 -- ip -br a show eth0        # IP trong dải 10.0.250.50-200
-pct exec 250 -- ping -c1 10.0.250.1       # gateway do SDN tạo
-pct exec 250 -- getent hosts deb.debian.org   # DNS do dnsmasq của SDN trả lời
-pct exec 250 -- ping -c1 -W2 1.1.1.1      # SNAT ra ngoài
-```
-
-**Xem IPAM:** Datacenter → SDN → **IPAM** — bảng lease của mọi guest trong zone. Sửa/đặt trước
-mapping được ở đây; sửa xong phải **restart guest từ PVE** (restart bên trong guest không đủ).
-
-### 5.5 DNS tuỳ chỉnh cho VNet
-
-dnsmasq mặc định dùng DNS của host. Muốn chỉ định riêng, sửa `/etc/pve/sdn/subnets.cfg`:
-
-```
-subnet: labzone-10.0.250.0-24
-	vnet vnet0
-	dhcp-range start-address=10.0.250.50,end-address=10.0.250.200
-	dhcp-dns-server 10.0.10.1
-	gateway 10.0.250.1
-	snat 1
-```
-
-Apply lại SDN rồi `pct exec 250 -- getent hosts pve1.lab.local` để xác nhận đã hỏi đúng DNS lab.
-
-### 5.6 Các loại Zone — chọn cái nào
-
-| Zone | Phạm vi | Dùng khi |
-|---|---|---|
-| **Simple** | **trong một node** (mỗi node một instance) | mạng NAT cục bộ, lab, DMZ nhỏ — **dùng ở bước này** |
-| **VLAN** | toàn cụm, dựa trên VLAN sẵn có | multi-tenant với hạ tầng VLAN có sẵn — chính là Bước 1/3 nhưng quản lý tập trung |
-| **QinQ** | toàn cụm, VLAN lồng VLAN | nhà cung cấp dịch vụ, chồng VLAN khách hàng |
-| **VXLAN** | toàn cụm, overlay L2 qua L3 | trải mạng qua nhiều site/subnet |
-| **EVPN** | toàn cụm, overlay + routing | multi-tenant có định tuyến L3, exit-node ra ngoài |
-
-> Simple zone là **zone cục bộ**: VM di trú sang node khác vẫn vào `vnet0` của node đó và giữ IP
-> nhờ IPAM cấp cụm, nhưng gateway/dnsmasq là của node mới. Muốn L2 thật sự trải toàn cụm thì
-> dùng **VLAN** hoặc **VXLAN** zone.
-
-### 5.7 Dọn dẹp (bắt buộc trước checkpoint)
-
-`vnet0` và CT 250 **không** thuộc thiết kế nền của khóa — gỡ để Bước 6 và challenge không bị nhiễu:
-
-```bash
-pct stop 250 && pct destroy 250 --purge
-qm set 130 --delete net1                   # gỡ NIC phụ trên OVS bridge
-# SDN: Datacenter -> SDN -> xoá Subnet -> VNet -> Zone -> Apply
-```
-
-`vmbr9`/`ovsint200` giữ lại được (không có NIC vật lý, vô hại), hoặc xoá khỏi
-`/etc/network/interfaces` rồi `ifreload -a` cho sạch.
-
----
-
-## Bước 6 — RBAC: user vận hành + group + ACL (least privilege)
-
-Tạo group vận hành VM, user `ops`, và gán role theo path (chạy một lần trên pve1 — đồng bộ cluster):
-
-```bash
-pveum group add vmops --comment "Van hanh VM/CT"
-pveum user add ops@pve --password 'Ops@2026'
-pveum user modify ops@pve --group vmops
-pveum acl modify /vms --group vmops --role PVEVMAdmin
-pveum acl modify /storage/vmpool --group vmops --role PVEDatastoreUser
-```
-
-Xác minh:
-
-```bash
-pveum acl list | grep vmops                  # thấy ACL tại /vms và /storage/vmpool
-pveum user permissions ops@pve --path /vms    # có quyền VM.* tại /vms
-```
-
-Kỳ vọng: user `ops@pve` có quyền quản lý VM tại `/vms`, không có quyền hạ tầng (cluster/network).
-
-> Từ giờ, thao tác VM hằng ngày dùng `ops@pve` (đăng nhập Web UI hoặc `pvesh` với token) — giữ `root@pam` cho cứu hộ. Nên bật 2FA cho `ops@pve` qua Web UI (User → TFA → TOTP).
-
-## Bước 7 — Firewall: giới hạn Web UI/SSH về mạng quản trị
+## Bước 4 — Firewall: giới hạn Web UI/SSH về mạng quản trị
 
 **Thứ tự an toàn — tạo rule cho phép TRƯỚC, siết default policy SAU.** Giữ một phiên SSH đang mở và sẵn console (outer hypervisor) phòng tự khóa.
 
@@ -428,7 +184,7 @@ pvesh set /cluster/firewall/options --enable 1
 pvesh set /cluster/firewall/options --policy_in DROP
 ```
 
-Xác minh — TỪ MỘT PHIÊN MỚI trong mạng 10.0.10.0/24, và kiểm cụm không vỡ:
+Xác minh — TỪ MỘT PHIÊN MỚI trong mạng 10.0.10.0/24, và kiểm cụm không bị lỗi:
 
 ```bash
 ssh root@10.0.10.11 true && echo "SSH mgmt OK"        # từ mạng mgmt: vào được
@@ -442,7 +198,238 @@ Kỳ vọng: truy cập admin từ mgmt OK; firewall `enable: 1`; **Ceph vẫn H
 
 > Nếu mất truy cập: vào console qua outer hypervisor rồi `systemctl stop pve-firewall && pve-firewall stop` (xả rule ngay tại node, **không cần quorum**). Chỉ sửa `/etc/pve/firewall/cluster.fw` hoặc `host.fw` (`enable: 0`) sau khi cụm còn quorum — `/etc/pve` là pmxcfs, mất quorum là read-only. Đây là lý do luôn giữ đường console dự phòng.
 
-## Bước 8 — Xác nhận cuối (chạy trên pve1)
+> Firewall **giữ nguyên trạng thái bật** từ đây. Bước 5 (SDN) sẽ cho bạn thấy ngay hệ quả của nó:
+> một dịch vụ mới chạy trên host — DHCP của SDN — sẽ bị chặn cho tới khi được mở có chủ đích.
+
+---
+
+## Bước 5 — SDN: mạng ảo, IPAM, DHCP và DNS trong Proxmox
+
+> Tới đây mọi IP đều **tĩnh** — đó là chủ ý để lab ổn định và chấm được. Bước này giới thiệu
+> **SDN**, nơi Proxmox tự làm gateway, **IPAM**, **DHCP** và **DNS** cho một mạng ảo, tách hẳn
+> khỏi hạ tầng đang chạy. Đây là cách Proxmox trả lời câu hỏi "quản lý DHCP/DNS ở đâu?".
+
+### 5.1 Cài dnsmasq (bắt buộc cho DHCP của SDN)
+
+Trên **mỗi node**:
+
+```bash
+apt-get install -y dnsmasq
+systemctl disable --now dnsmasq     # SDN tự quản lý tiến trình riêng, KHÔNG dùng service mặc định
+```
+
+### 5.2 Zone → VNet → Subnet (Datacenter → SDN)
+
+| Lớp | Là gì | Giá trị dùng trong lab |
+|---|---|---|
+| **Zone** | Kiểu mạng ảo + phạm vi | `labzone`, type **Simple**, ✅ automatic DHCP, IPAM = `pve` |
+| **VNet** | "Switch ảo" học viên gắn VM vào | `vnet0`, thuộc `labzone` |
+| **Subnet** | Dải IP + gateway + SNAT | `10.0.250.0/24`, gateway `10.0.250.1`, ✅ SNAT |
+| **DHCP Range** | Dải cấp động | `10.0.250.50` → `10.0.250.200` |
+
+Làm trên GUI: **Datacenter → SDN → Zones → Add → Simple** (mục Advanced có *automatic DHCP*),
+rồi **VNets → Add**, rồi chọn vnet0 → **Subnets → Create** (tab *DHCP Ranges* để nhập dải).
+
+Cuối cùng bấm **SDN → Apply** và chờ task `reload network` xong sạch.
+
+```bash
+cat /etc/pve/sdn/zones.cfg /etc/pve/sdn/vnets.cfg /etc/pve/sdn/subnets.cfg
+ip -br a show vnet0                 # vnet0 có IP gateway 10.0.250.1
+```
+
+### 5.3 Gắn guest vào VNet — và thấy firewall chặn DHCP
+
+Firewall đã bật từ Bước 4 với `policy_in DROP`. DHCP server và DNS của SDN chạy **ngay trên host**:
+dnsmasq nghe trên `vnet0`, địa chỉ `10.0.250.1`. Yêu cầu DHCP từ guest vì thế là traffic **đi vào
+host** — đúng thứ host firewall đang chặn. Rule mặc định của Proxmox không biết gì về `vnet0`.
+
+Tạo CT xin IP bằng DHCP và quan sát:
+
+```bash
+CTTPL=$(pvesm list nfs-store --content vztmpl | awk '/debian-13-standard/{print $1; exit}')
+pct create 250 "$CTTPL" --hostname sdn-demo --cores 1 --memory 512 \
+  --rootfs vmpool:4 --unprivileged 1 \
+  --net0 name=eth0,bridge=vnet0,ip=dhcp
+pct start 250
+sleep 15
+pct exec 250 -- ip -br -4 a show eth0     # KỲ VỌNG: KHÔNG có IPv4 — DHCP bị chặn
+```
+
+Chứng minh gói bị chặn ở đâu — trên node, trong khi CT đang xin lease:
+
+```bash
+timeout 20 tcpdump -ni vnet0 port 67 or port 68
+# Thấy DHCPDISCOVER từ CT đi, nhưng KHÔNG có DHCPOFFER trả về:
+# yêu cầu đã tới host rồi bị firewall bỏ trước khi đến dnsmasq.
+```
+
+> Không phải lỗi SDN, cũng không phải lỗi CT. Đây là quy luật chung: **mọi dịch vụ mới chạy trên host
+> đều bị chặn cho tới khi được mở có chủ đích** — DHCP của SDN chỉ là ví dụ đầu tiên bạn gặp.
+
+### 5.4 Mở firewall cho DHCP và DNS trên `vnet0`
+
+Thêm hai rule ở **Datacenter** (một lần, áp cho `vnet0` của mọi node — Simple zone chạy trên từng
+node, nên rule cấp cụm là đúng chỗ). GUI: Datacenter → Firewall → Add.
+
+| Direction | Action | Interface | Macro | Dest |
+|---|---|---|---|---|
+| in | ACCEPT | `vnet0` | `DHCPfwd` | — |
+| in | ACCEPT | `vnet0` | `DNS` | `10.0.250.1` |
+
+Hoặc bằng CLI:
+
+```bash
+pvesh create /cluster/firewall/rules --type in --action ACCEPT --iface vnet0 \
+  --macro DHCPfwd --enable 1 --comment "SDN DHCP (Lab04 B5)"
+pvesh create /cluster/firewall/rules --type in --action ACCEPT --iface vnet0 \
+  --macro DNS --dest 10.0.250.1 --enable 1 --comment "SDN DNS (Lab04 B5)"
+```
+
+> Đặt **Dest = gateway** cho rule DNS. Bỏ trống là mở mọi traffic DNS, có thể bị lợi dụng để
+> lách các rule khác.
+
+Cho CT xin lease lại rồi kiểm:
+
+```bash
+pct reboot 250
+sleep 15
+pct exec 250 -- ip -br -4 a show eth0        # giờ CÓ IP trong dải 10.0.250.50-200
+pct exec 250 -- getent hosts deb.debian.org  # DNS do dnsmasq của SDN trả lời
+pct exec 250 -- ping -c1 -W2 1.1.1.1         # SNAT ra ngoài — OK
+pct exec 250 -- ping -c1 -W2 10.0.250.1      # gateway do SDN tạo — KỲ VỌNG: FAIL
+```
+
+Kỳ vọng: có lease, DNS trả lời, `1.1.1.1` ping được — nhưng **ping gateway `10.0.250.1` thì không**.
+
+Nghe ngược đời: ra được tới Internet mà không ping được chính gateway của mình. Lý do là hai gói đi
+theo hai đường khác nhau qua host:
+
+| Gói | Đích | Đường đi trong host | Bị policy `DROP` của host chặn? |
+|---|---|---|---|
+| ping `1.1.1.1` | máy ngoài | **chuyển tiếp** (FORWARD) — vào `vnet0`, SNAT, ra `vmbr0` | Không |
+| ping `10.0.250.1` | **chính host** | **đi vào** host (INPUT) | **Có** — chưa có rule cho ICMP trên `vnet0` |
+
+Hai rule ở trên chỉ mở DHCP và DNS. ICMP tới host là một "dịch vụ" nữa, và nó cũng phải được mở có
+chủ đích:
+
+```bash
+pvesh create /cluster/firewall/rules --type in --action ACCEPT --iface vnet0 \
+  --macro Ping --dest 10.0.250.1 --enable 1 --comment "SDN ping gateway (Lab04 B5)"
+sleep 3
+pct exec 250 -- ping -c1 -W2 10.0.250.1     
+```
+
+> Đây là mẫu hình cần nhớ khi chẩn đoán: *"ra được Internet mà không ping được gateway"* gần như luôn
+> là **firewall INPUT của gateway**, không phải lỗi định tuyến — nếu định tuyến hỏng thì đã không ra
+> được Internet. (Rule này cũng được gỡ ở 5.7 cùng hai rule kia, vì lệnh dọn lọc theo `iface vnet0`.)
+
+**Xem IPAM:** Datacenter → SDN → **IPAM** — bảng lease của mọi guest trong zone. Sửa/đặt trước
+mapping được ở đây; sửa xong phải **restart guest từ PVE** (restart bên trong guest không đủ).
+
+### 5.5 DNS tuỳ chỉnh cho VNet
+
+**Ghi lại trạng thái TRƯỚC khi sửa** — để lát nữa thấy tận mắt DHCP đổi nó:
+
+```bash
+pct exec 250 -- cat /etc/resolv.conf      # ghi lại dòng nameserver (thường là gateway 10.0.250.1)
+```
+
+Muốn VNet phát DNS server riêng, sửa `/etc/pve/sdn/subnets.cfg`:
+
+```
+subnet: labzone-10.0.250.0-24
+	vnet vnet0
+	dhcp-range start-address=10.0.250.50,end-address=10.0.250.200
+	dhcp-dns-server 10.0.10.1
+	gateway 10.0.250.1
+	snat 1
+```
+
+**Apply lại SDN**, rồi cho CT **xin lease mới** — tuỳ chọn DHCP (như DNS server) chỉ đến client
+khi có lease mới, sửa cấu hình xong chưa đủ:
+
+```bash
+pct reboot 250 && sleep 15
+pct exec 250 -- cat /etc/resolv.conf           # nameserver giờ là 10.0.10.1 — ĐỔI so với lúc trước
+pct exec 250 -- getent hosts pbs0.lab.local    # phải ra 10.0.10.5
+```
+
+> Chính sự **thay đổi** của dòng `nameserver` mới là bằng chứng DHCP đã apply — chỉ nhìn giá trị sau
+> thì chưa đủ, vì `10.0.10.1` cũng là DNS của node, và với CT không đặt `nameserver` riêng, Proxmox có
+> thể chép DNS của host vào. File do Proxmox viết mở đầu bằng `# --- BEGIN PVE ---`; không có dòng đó
+> thì là DHCP client viết. Nếu lúc trước đã là `10.0.10.1` sẵn thì bước này không chứng minh được gì —
+> thử lại với một giá trị khác, ví dụ `dhcp-dns-server 1.1.1.1` (lúc đó `pbs0` sẽ **không** resolve được,
+> cũng là một kết quả đáng xem).
+
+> Vì sao hỏi `pbs0` chứ không phải `pve1`? `pbs0.lab.local` là tên **chỉ DNS của lab biết** — DNS
+> công cộng không trả lời được — nên resolve được nghĩa là CT đang hỏi đúng DNS lab. Còn tên node
+> (`pve1`, ...) **không** nằm trong DNS của jump: mọi cụm trong lớp dùng chung tên `pve1/2/3` với IP
+> khác nhau, nên tên node chỉ sống trong `/etc/hosts` của từng node (Lab 01). Chạy
+> `getent hosts pve1.lab.local` **trên node** vẫn ra kết quả — nhưng là từ `/etc/hosts` cục bộ, không
+> phải từ DNS.
+
+### 5.6 Các loại Zone — lựa chọn như thế nào?
+
+| Zone | Phạm vi | Dùng khi |
+|---|---|---|
+| **Simple** | **trong một node** (mỗi node một instance) | mạng NAT cục bộ, lab, DMZ nhỏ — **dùng ở bước này** |
+| **VLAN** | toàn cụm, dựa trên VLAN sẵn có | multi-tenant với hạ tầng VLAN có sẵn — chính là Bước 1/3 nhưng quản lý tập trung |
+| **QinQ** | toàn cụm, VLAN lồng VLAN | nhà cung cấp dịch vụ, chồng VLAN khách hàng |
+| **VXLAN** | toàn cụm, overlay L2 qua L3 | trải mạng qua nhiều site/subnet |
+| **EVPN** | toàn cụm, overlay + routing | multi-tenant có định tuyến L3, exit-node ra ngoài |
+
+> Simple zone là **zone cục bộ**: VM di trú sang node khác vẫn vào `vnet0` của node đó và giữ IP
+> nhờ IPAM cấp cụm, nhưng gateway/dnsmasq là của node mới. Muốn L2 thật sự trải toàn cụm thì
+> dùng **VLAN** hoặc **VXLAN** zone.
+
+### 5.7 Dọn dẹp (bắt buộc trước checkpoint)
+
+`vnet0` và CT 250 **không** thuộc thiết kế nền của khóa — gỡ để checkpoint và challenge không bị nhiễu:
+
+```bash
+pct stop 250 && pct destroy 250 --purge
+qm set 130 --delete net1                   # gỡ NIC phụ trên OVS bridge
+# SDN: Datacenter -> SDN -> xoá Subnet -> VNet -> Zone -> Apply
+
+# Gỡ các rule firewall của vnet0 (DHCP, DNS, Ping) — nếu không, cluster.fw giữ mãi rule trỏ tới interface đã chết.
+# Xoá từ vị trí CAO xuống THẤP: xoá một rule thì các rule phía sau bị đôn số.
+for pos in $(pvesh get /cluster/firewall/rules --output-format json | python3 -c '
+import sys, json
+rs = [r for r in json.load(sys.stdin) if r.get("iface") == "vnet0"]
+print(" ".join(str(r["pos"]) for r in sorted(rs, key=lambda r: -r["pos"])))'); do
+  pvesh delete /cluster/firewall/rules/$pos
+done
+grep -q vnet0 /etc/pve/firewall/cluster.fw && echo "CÒN rule vnet0" || echo "rule vnet0 đã gỡ"
+```
+
+---
+
+## Bước 6 — RBAC: user vận hành + group + ACL (least privilege)
+
+Tạo group vận hành VM, user `ops`, và gán role theo path (chạy một lần trên pve1 — đồng bộ cluster):
+
+```bash
+pveum group add vmops --comment "Van hanh VM/CT"
+pveum user add ops@pve --password 'Ops@2026'
+pveum user modify ops@pve --group vmops
+pveum acl modify /vms --group vmops --role PVEVMAdmin
+pveum acl modify /storage/vmpool --group vmops --role PVEDatastoreUser
+```
+
+Xác minh:
+
+```bash
+pveum acl list | grep vmops                  # thấy ACL tại /vms và /storage/vmpool
+pveum user permissions ops@pve --path /vms    # có quyền VM.* tại /vms
+```
+
+Kỳ vọng: user `ops@pve` có quyền quản lý VM tại `/vms`, không có quyền hạ tầng (cluster/network).
+
+> Từ giờ, thao tác VM hằng ngày dùng `ops@pve` (đăng nhập Web UI hoặc `pvesh` với token) — giữ `root@pam` cho cứu hộ. Nên bật 2FA cho `ops@pve` qua Web UI (User → TFA → TOTP).
+
+---
+
+## Bước 7 — Xác nhận cuối (chạy trên pve1)
 
 ```bash
 echo "== MTU storage =="
@@ -455,6 +442,9 @@ echo "== VM130 VLAN =="
 qm config 130 | grep -q 'tag=100' && echo "VM VLAN OK" || echo "VM VLAN FAIL"
 echo "== RBAC =="
 pveum acl list | grep -q 'vmops' && echo "RBAC OK" || echo "RBAC FAIL"
+echo "== SDN đã dọn (Bước 5.7) =="
+! ip link show vnet0 >/dev/null 2>&1 && ! grep -q vnet0 /etc/pve/firewall/cluster.fw \
+  && echo "SDN cleanup OK" || echo "SDN cleanup FAIL — còn vnet0 hoặc rule firewall của nó"
 echo "== firewall =="
 pvesh get /cluster/firewall/options --output-format json 2>/dev/null | grep -q '"enable":1' && echo "firewall OK" || echo "firewall FAIL"
 echo "== nền =="
@@ -467,7 +457,7 @@ Kỳ vọng: tất cả `OK`.
 
 # Phụ lục A (TUỲ CHỌN) — Publish một service ra mạng ngoài
 
-> **Không thuộc checkpoint 4.** Bước 8 ở trên vẫn là điều kiện duy nhất để nhận challenge —
+> **Không thuộc checkpoint 4.** Bước 7 ở trên vẫn là điều kiện duy nhất để nhận challenge —
 > cụm không có IP ngoài vẫn hoàn thành Bài 04 bình thường. Phụ lục này chạy khi lớp **có
 > IP ngoài dư và còn thời gian** (~45 phút).
 >
@@ -576,7 +566,7 @@ nginx -t && systemctl reload nginx'
 
 ## A.4 Mở firewall cho port đã publish
 
-Bước 7 vừa siết cụm lại. Service mới phải được mở **có chủ đích** — đây chính là quy trình thật:
+Bước 4 đã siết cụm lại. Service mới phải được mở **có chủ đích** — đây chính là quy trình thật:
 
 ```bash
 # Nếu đã bật firewall trên NIC của VM 440 thì thêm rule cho tcp/80:
