@@ -1,9 +1,8 @@
 # Lab 06 — Capstone: Sự cố Production
 
-> Bài cuối khóa là **một ca trực sự cố**, không phải bài dựng. Cụm của bạn đang chạy một ứng dụng production (**VM 900**) được dựng sẵn đúng chuẩn — rồi nhiều thứ đã hỏng cùng lúc. Bạn tiếp nhận ticket, chẩn đoán, sửa cho tới khi hệ thống **khỏe lại hoàn toàn**.
+> Bài cuối khóa là **một ca trực sự cố**. Cụm của bạn đang chạy một ứng dụng production (**VM 900**) được dựng sẵn đúng chuẩn — rồi nhiều thứ đã hỏng cùng lúc. Bạn tiếp nhận ticket, chẩn đoán, sửa cho tới khi hệ thống **khỏe lại hoàn toàn**.
 >
-> **Thời gian:** 2.5–3 giờ. **Chấm:** `grade.sh` — thang 100. **≥ 80 = ĐẠT**, **100 = QUALIFIED**.
-> Được dùng mọi nguồn như khi đi làm thật: tài liệu Proxmox, Google, AI, ghi chú của bạn.
+> **Thời gian:** 2.5–3 giờ. **Chấm:** `grade.sh` — thang điểm 100. **≥ 80 = ĐẠT**, **100 = QUALIFIED**.
 
 ## Ticket #4711 — P1
 
@@ -29,7 +28,7 @@ Mọi thứ trong ticket đều là **triệu chứng**, không phải nguyên n
 > Storage `pbs` (namespace của bạn) đã kết nối sẵn từ Lab 05.
 > Địa chỉ trên là của **cụm 0**. Cụm index N: VLAN = `110 + 500×N`, subnet `10.N.110.0/24` (gateway `.1`, VM 900 `.90`) — grader in đúng giá trị của cụm bạn ở dòng mục.
 
-## Luật chơi — vi phạm thì mục tương ứng bị 0 điểm (grader tự phát hiện)
+## Các điểm không được vi phạm
 
 - **Không tắt firewall** ở bất kỳ tầng nào (Datacenter, VM, `firewall=1` trên NIC), không đổi policy VM 900 thành `ACCEPT`.
 - **Không gỡ HA** của VM 900, không sửa rule `capstone` (node, ưu tiên, `strict`), không tắt failback.
@@ -37,35 +36,15 @@ Mọi thứ trong ticket đều là **triệu chứng**, không phải nguyên n
 - **Không destroy / restore đè VM 900** — đó là dữ liệu production; backup là để phòng, không phải để "sửa".
 - Không đụng `jump`, `pbs0`, Proxmox lớp ngoài.
 
-Hai người một cụm: cùng một ca trực — **thống nhất trước khi gõ**, đổi người cầm bàn phím mỗi khi sửa xong một lỗi.
+Mỗi team một cụm: team trong cùng một ca trực — **thống nhất trước khi action**.
 
-## Tự chấm — bao nhiêu lần tùy ý
+## Tự chấm
 
 ```bash
 cd ~/capstone-grader && ./grade.sh
 ```
 
-Grader **chỉ đọc**, hiện **toàn bộ danh sách mục** và mục nào đã/chưa đạt. Danh sách đó cũng là gợi ý: nó mô tả trạng thái khỏe, không mô tả cách sửa.
-
-| Nhóm | Mục | Điểm |
-|---|---|---|
-| **A. Mạng ứng dụng (45)** | VM 900 ping được gateway từ trong guest (firewall vẫn bật đủ) | 10 |
-| | Jump ping được VM 900 (firewall vẫn bật đủ) | 10 |
-| | VM 900 phân giải được DNS | 5 |
-| | VLAN 110 có trên `vmbr0` của cả 3 node — cấu hình lưu + đang chạy | 15 |
-| | Không còn cơ chế nào tự ghi đè lại cấu hình mạng hỏng | 5 |
-| **B. HA / di chuyển (30)** | `vm:900` HA `started`, đang chạy | 10 |
-| | Rule `capstone` giữ nguyên, failback còn bật | 5 |
-| | VM 900 không còn volume trên storage không-shared | 10 |
-| | VM 900 đang chạy trên node ưu tiên `pve2` | 5 |
-| **C. Quyền & backup (25)** | `appops@pve` có `VM.PowerMgmt` + `VM.Migrate` trên VM 900, không có quyền quản trị | 15 |
-| | PBS có bản backup VM 900 tạo **sau** khi sự cố bắt đầu | 10 |
-
-**Hard gate** (trượt ngay): cụm mất quorum · Ceph `HEALTH_ERR`.
-
-## Tra cứu nhanh (cú pháp — KHÔNG phải trình tự lời giải)
-
-Triage order của khóa: **Network → Storage → Cluster → Proxmox**. Sửa xong một thứ, chạy lại grader — đừng sửa nhiều thứ một lúc rồi không biết cái nào có tác dụng.
+## Tra cứu nhanh
 
 **Mạng node & VLAN**
 
@@ -119,5 +98,3 @@ pveum acl list ; pveum user permissions <user> --path /vms/<id>
 vzdump <id> --storage pbs --mode snapshot              # backup ngay
 pvesm list pbs --vmid <id>
 ```
-
-> Khi grader lên **100/100 = QUALIFIED**. Còn thời gian sau khi ĐẠT (≥ 80): đi tiếp tới 100 — ngoài đời, "gần như khỏe" nghĩa là lần sự cố sau sẽ tệ hơn.
